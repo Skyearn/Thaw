@@ -413,6 +413,34 @@ final class MenuBarItemManager: ObservableObject {
         }
     }
 
+    /// Prefix used in `pendingRelocations` values to mark items whose rehide
+    /// failed terminally in the current session. The suffix is the item's
+    /// `windowID` at the time of failure, used to detect app relaunches.
+    private static let waitForRelaunchPrefix = "waitForRelaunch:"
+
+    /// Returns a `pendingRelocations` sentinel value that suppresses same-session
+    /// move attempts. Encodes `windowID` so that a relaunch (new windowID) clears
+    /// the suppression automatically.
+    private func waitForRelaunchValue(windowID: CGWindowID, section: MenuBarSection.Name) -> String {
+        "\(Self.waitForRelaunchPrefix)\(windowID):\(sectionKey(for: section))"
+    }
+
+    /// Parses a `pendingRelocations` sentinel value.
+    /// Returns `(windowID, section)` if the value is a wait-for-relaunch entry,
+    /// or `nil` if it is a plain section key.
+    private func parseWaitForRelaunch(_ value: String) -> (windowID: CGWindowID, section: MenuBarSection.Name)? {
+        guard value.hasPrefix(Self.waitForRelaunchPrefix) else { return nil }
+        let payload = value.dropFirst(Self.waitForRelaunchPrefix.count)
+        // Format: "<windowID>:<sectionKey>"
+        guard let colonIndex = payload.firstIndex(of: ":") else { return nil }
+        let widString = String(payload[payload.startIndex ..< colonIndex])
+        let secString = String(payload[payload.index(after: colonIndex)...])
+        guard let wid = CGWindowID(widString),
+              let section = sectionName(for: secString)
+        else { return nil }
+        return (wid, section)
+    }
+
     /// Returns the effective section for newly detected menu bar items, falling back
     /// to hidden when the always-hidden section is currently disabled.
     var effectiveNewItemsSection: MenuBarSection.Name {
@@ -2322,13 +2350,24 @@ extension MenuBarItemManager {
         warpCursorAfter: Bool = true
     ) async throws {
         do {
-            try await eventSemaphore.wait(timeout: .seconds(5))
+            try await eventSemaphore.wait(timeout: .milliseconds(3500))
         } catch is SimpleSemaphore.TimeoutError {
-            MenuBarItemManager.diagLog.error("eventSemaphore timed out in postMoveEvents, forcing signal and retrying")
-            await eventSemaphore.signal()
+            // wait(timeout:) already restores the semaphore count via cancelWaiter
+            // when it times out — do NOT call signal() here or the semaphore
+            // is over-released and two callers can hold it simultaneously.
+            MenuBarItemManager.diagLog.error("eventSemaphore timed out (3.5s) in postMoveEvents")
             throw EventError.cannotComplete
         }
         defer { Task.detached { [eventSemaphore] in await eventSemaphore.signal() } }
+
+        // Fast-fail if the target process is dead. CGEvent.tapCreateForPid
+        // silently produces an invalid Mach port for dead PIDs, causing every
+        // scrombleEvent to time out and burn the full 3.5 s semaphore budget.
+        let eventPID = getEventPID(for: item)
+        if kill(eventPID, 0) == -1, errno == ESRCH {
+            MenuBarItemManager.diagLog.error("postMoveEvents: target PID \(eventPID) for \(item.logString) is dead — skipping move")
+            throw EventError.cannotComplete
+        }
 
         var itemOrigin = try await getCurrentBounds(for: item).origin
         let targetPoints = try await getTargetPoints(forMoving: item, to: destination, on: displayID)
@@ -2581,8 +2620,12 @@ extension MenuBarItemManager {
             }
         }
 
-        // After all attempts, validate the final position
+        // All attempts exhausted without confirmed position. Run the stuck-item
+        // validator first (recovers x=-1 blocks), then throw so callers know
+        // the item did not reach the destination.
         await validateItemPositionAfterMove(item: item, destination: destination, on: resolvedDisplayID)
+        MenuBarItemManager.diagLog.error("move: all \(maxAttempts) attempt(s) exhausted without verifying \(item.logString) reached \(destination.logString)")
+        throw EventError.cannotComplete
     }
 }
 
@@ -2607,12 +2650,15 @@ extension MenuBarItemManager {
     ///   - item: The menu bar item to click.
     ///   - mouseButton: The mouse button to click the item with.
     private func postClickEvents(item: MenuBarItem, mouseButton: CGMouseButton) async throws {
-        // Try to acquire semaphore with timeout
+        // Try to acquire semaphore with timeout. 3.5 s covers legitimate slow
+        // operations (adaptive click cap is 1000 ms × 2 for double mouseUp =
+        // ~2 s of event work plus overhead). wait(timeout:) already restores
+        // the semaphore count via cancelWaiter on timeout — do NOT call
+        // signal() in the catch block or the semaphore is over-released.
         do {
-            try await eventSemaphore.wait(timeout: .seconds(5))
+            try await eventSemaphore.wait(timeout: .milliseconds(3500))
         } catch is SimpleSemaphore.TimeoutError {
-            MenuBarItemManager.diagLog.error("eventSemaphore timed out in postClickEvents for \(item.logString), forcing signal and retrying")
-            await eventSemaphore.signal()
+            MenuBarItemManager.diagLog.error("eventSemaphore timed out (3.5s) in postClickEvents for \(item.logString)")
             throw EventError.cannotComplete
         }
         defer { Task.detached { [eventSemaphore] in await eventSemaphore.signal() } }
@@ -2692,7 +2738,16 @@ extension MenuBarItemManager {
     /// - Parameters:
     ///   - item: The menu bar item to click.
     ///   - mouseButton: The mouse button to click the item with.
-    func click(item: MenuBarItem, with mouseButton: CGMouseButton, skipInputPause: Bool = false) async throws {
+    /// Clicks a menu bar item with the given mouse button.
+    ///
+    /// - Parameters:
+    ///   - item: The menu bar item to click.
+    ///   - mouseButton: The mouse button to click the item with.
+    ///   - skipInputPause: Skip waiting for user input to pause.
+    ///   - maxAttempts: Maximum number of click attempts (default 3).
+    ///     Pass `1` from `temporarilyShow` so a single failure returns
+    ///     immediately and the caller's fallback path fires promptly.
+    func click(item: MenuBarItem, with mouseButton: CGMouseButton, skipInputPause: Bool = false, maxAttempts: Int = 3) async throws {
         guard let appState else {
             throw EventError.cannotComplete
         }
@@ -2713,7 +2768,7 @@ extension MenuBarItemManager {
             appState.hidEventManager.startAll()
         }
 
-        let maxAttempts = 3 // Reduced from 4 to minimize accumulated delay
+        let maxAttempts = max(1, maxAttempts)
         let attemptStartTime = Date.now
         for n in 1 ... maxAttempts {
             guard !Task.isCancelled else {
@@ -2922,6 +2977,30 @@ extension MenuBarItemManager {
         }
     }
 
+    /// Waits until the item's Window Server origin differs from `previousOrigin`,
+    /// or until `timeout` elapses.
+    ///
+    /// Used on the fast path of `temporarilyShow` as a lightweight alternative
+    /// to `waitForItemPositionToSettle`: we only need to confirm the Window
+    /// Server has applied the new position — we don't need two consecutive
+    /// identical readings.
+    private nonisolated func waitForItemToLeaveOrigin(
+        item: MenuBarItem,
+        previousOrigin: CGPoint,
+        timeout: Duration
+    ) async {
+        let pollInterval = Duration.milliseconds(15)
+        let deadline = ContinuousClock.now + timeout
+        while ContinuousClock.now < deadline {
+            await eventSleep(for: pollInterval)
+            if let currentOrigin = Bridging.getWindowBounds(for: item.windowID)?.origin,
+               currentOrigin != previousOrigin
+            {
+                return
+            }
+        }
+    }
+
     /// Schedules a timer for the given interval that rehides the
     /// temporarily shown items when fired.
     private func runRehideTimer(for interval: TimeInterval? = nil) {
@@ -2948,21 +3027,36 @@ extension MenuBarItemManager {
             }
     }
 
-    /// Temporarily shows the given item.
+    /// The result of a ``temporarilyShow(item:clickingWith:on:fastPath:)`` call.
+    enum TemporaryShowResult {
+        /// The item was never moved — a precondition failed (missing state,
+        /// no return destination, no anchor, or the move itself failed).
+        /// The item is still hidden; do **not** attempt a fallback click.
+        case showFailed
+        /// The item was moved into the visible area **and** the synthetic
+        /// click completed successfully.
+        case movedAndClicked
+        /// The item was moved into the visible area but the synthetic click
+        /// failed. The icon is now visible; callers may attempt a fallback
+        /// click using live bounds.
+        case movedButClickFailed
+    }
+
+    /// Temporarily moves `item` into the visible area next to the Ice icon,
+    /// clicks it, then schedules a rehide.
     ///
-    /// The item is cached and returned to its original location after approximately
-    /// 15 seconds, though it may be sooner (e.g., when switching apps) or later
-    /// due to the smart rehide logic (e.g., +1s for recent user input, +3s when
-    /// a menu is open).
+    /// The item is returned to its original location after approximately
+    /// 15 seconds, though it may be sooner (e.g. when switching apps) or
+    /// later due to the smart rehide logic.
     ///
-    /// - Parameters:
-    ///   - item: The item to temporarily show.
-    ///   - mouseButton: The mouse button to click the item with.
-    ///   - displayID: The display identifier to show the item on.
-    func temporarilyShow(item: MenuBarItem, clickingWith mouseButton: CGMouseButton, on displayID: CGDirectDisplayID? = nil, fastPath: Bool = false) async {
+    /// - Returns: A ``TemporaryShowResult`` describing whether the move and
+    ///   click succeeded. Only act on ``TemporaryShowResult/movedButClickFailed``
+    ///   for fallback clicks — the item is hidden for every other non-success case.
+    @discardableResult
+    func temporarilyShow(item: MenuBarItem, clickingWith mouseButton: CGMouseButton, on displayID: CGDirectDisplayID? = nil, fastPath: Bool = false) async -> TemporaryShowResult {
         guard let appState else {
             MenuBarItemManager.diagLog.error("Missing AppState, so not showing \(item.logString)")
-            return
+            return .showFailed
         }
 
         MenuBarItemManager.diagLog.debug("temporarilyShow: started for \(item.logString)")
@@ -2991,9 +3085,28 @@ extension MenuBarItemManager {
             rehideCancellable?.cancel()
             await rehideTemporarilyShownItems(force: true, isCalledFromTemporarilyShow: true)
 
-            // If some items failed to rehide (e.g. move timed out), don't remove
-            // them from the contexts list. They will be retried by the rehide timer
-            // or the next temporarilyShow call.
+            // Only treat contexts with rehideAttempts > 0 as genuinely stuck
+            // (move was attempted and failed). Contexts with rehideAttempts == 0
+            // but notFoundAttempts > 0 are merely not visible on the active
+            // space right now — they are transient and will retry fine.
+            // Bailing on notFound items would leave them permanently stranded.
+            let stuckItems = temporarilyShownItemContexts.filter {
+                !$0.tag.matchesIgnoringWindowID(item.tag) && $0.rehideAttempts > 0
+            }
+            if !stuckItems.isEmpty {
+                MenuBarItemManager.diagLog.error(
+                    """
+                    temporarilyShow: aborting — \(stuckItems.count) item(s) still stuck \
+                    after force-rehide: \(stuckItems.map { $0.tag }). \
+                    Avoiding further semaphore saturation.
+                    """
+                )
+                // Re-arm the rehide timer so stuck contexts are retried rather
+                // than left stranded with no scheduled retry.
+                runRehideTimer()
+                return .showFailed
+            }
+
             if temporarilyShownItemContexts.contains(where: { $0.tag.matchesIgnoringWindowID(item.tag) }) {
                 // The item we want to show is already in the temporary list.
                 // This can happen if the user clicks the same item twice very fast.
@@ -3007,7 +3120,7 @@ extension MenuBarItemManager {
 
         guard let returnInfo = getReturnDestination(for: item, in: items) else {
             MenuBarItemManager.diagLog.error("No return destination for \(item.logString) on display \(resolvedDisplayID)")
-            return
+            return .showFailed
         }
 
         // Prefer inserting to the left of the Thaw/visible control item so the icon appears
@@ -3021,7 +3134,7 @@ extension MenuBarItemManager {
             let alert = NSAlert()
             alert.messageText = String(localized: "Not enough room to show \"\(item.displayName)\"")
             alert.runModal()
-            return
+            return .showFailed
         }
 
         let moveDestination: MoveDestination = .leftOfItem(anchor)
@@ -3052,21 +3165,59 @@ extension MenuBarItemManager {
 
         MenuBarItemManager.diagLog.debug("Temporarily showing \(item.logString) on display \(resolvedDisplayID)")
 
+        // Capture the item's origin before the move so the fast-path settle
+        // can detect when the Window Server has applied the new position.
+        let preMoveOrigin = Bridging.getWindowBounds(for: item.windowID)?.origin
+
         do {
             if fastPath {
-                // Single attempt move — the first attempt always repositions the item
-                // close enough. Skipping retries eliminates the visible jitter from
-                // the 8-attempt retry loop with exponentially increasing timeouts.
-                try await move(item: item, to: moveDestination, on: resolvedDisplayID, skipInputPause: true, maxMoveAttempts: 1)
+                // Two-attempt move on the fast path. The first attempt almost always
+                // repositions the item correctly; the second is a cheap safety net for
+                // the rare case where the event cycle is dropped under CPU load.
+                // Keeping retries at 2 (vs. the default 8) avoids the visible jitter
+                // from a long retry loop while still tolerating one bad cycle.
+                try await move(item: item, to: moveDestination, on: resolvedDisplayID, skipInputPause: true, maxMoveAttempts: 2)
             } else {
                 try await move(item: item, to: moveDestination, on: resolvedDisplayID, skipInputPause: true)
             }
         } catch {
             MenuBarItemManager.diagLog.error("Error showing item: \(error)")
-            pendingRelocations.removeValue(forKey: tagIdentifier)
-            pendingReturnDestinations.removeValue(forKey: tagIdentifier)
-            persistPendingRelocations()
-            return
+
+            // Determine whether the item physically left its original position
+            // despite move() throwing. itemCache is a pre-move snapshot and is
+            // not updated during a move() call, so itemCache.address(for:) would
+            // always return originalSection here — giving a false negative.
+            // Instead, compare live Window Server bounds against the origin
+            // captured before the move started. Any nil (window gone or
+            // pre-move capture missed) is treated as moved/unknown — preserving
+            // rehide metadata is the safe-side choice.
+            let currentOrigin = Bridging.getWindowBounds(for: item.windowID)?.origin
+            // Treat any nil as "moved/unknown" — preserving rehide metadata is
+            // the safe-side choice when the move outcome cannot be determined.
+            // Note: in Swift nil != nil evaluates to false, so without the nil
+            // guards both-nil would wrongly indicate "item never moved."
+            let itemHasMoved = currentOrigin == nil || preMoveOrigin == nil || currentOrigin != preMoveOrigin
+
+            if itemHasMoved {
+                // The item is no longer where it started — keep the rehide
+                // metadata so the persistent-relocation path can restore it
+                // when the app relaunches or the rehide timer fires.
+                MenuBarItemManager.diagLog.warning("move() threw but item \(item.logString) is no longer in \(originalSection) — preserving pending rehide metadata")
+                // pendingRelocations already set above; re-assert return destination
+                // in case it was not yet written (guard-exit paths above this block).
+                pendingReturnDestinations[tagIdentifier] = [
+                    "neighbor": neighborTag.tagIdentifier,
+                    "position": position,
+                ]
+                persistPendingRelocations()
+            } else {
+                // Item never moved — safe to discard the speculative metadata.
+                pendingRelocations.removeValue(forKey: tagIdentifier)
+                pendingReturnDestinations.removeValue(forKey: tagIdentifier)
+                persistPendingRelocations()
+            }
+
+            return .showFailed
         }
 
         let context = TemporarilyShownItemContext(
@@ -3087,9 +3238,22 @@ extension MenuBarItemManager {
 
         let clickItem: MenuBarItem
         if fastPath {
-            // Fast path: skip settle wait, re-fetch, and extra sleep to minimize
-            // the time the jittering icon is visible before the menu opens.
-            clickItem = item
+            // Fast path: lightweight settle (max 150 ms, 15 ms poll) so the
+            // click target coordinates are live rather than the pre-move bounds.
+            // This is shorter than the full waitForItemPositionToSettle (250 ms)
+            // to keep the IceBar click feel snappy.
+            if let preMoveOrigin {
+                await waitForItemToLeaveOrigin(item: item, previousOrigin: preMoveOrigin, timeout: .milliseconds(150))
+            }
+
+            // Re-fetch the item so getCurrentBounds inside postClickEvents
+            // uses a fresh window reference rather than the stale pre-move struct.
+            let refreshedItems = await MenuBarItem.getMenuBarItems(on: resolvedDisplayID, option: .onScreen)
+            clickItem = refreshedItems.first(where: { $0.windowID == item.windowID }) ??
+                refreshedItems.first(where: {
+                    $0.tag.matchesIgnoringWindowID(item.tag) &&
+                        ($0.sourcePID ?? $0.ownerPID) == (item.sourcePID ?? item.ownerPID)
+                }) ?? item
         } else {
             // Wait for the item's position to stabilize after the move. Some
             // apps need time to process the window relocation before they can
@@ -3112,21 +3276,48 @@ extension MenuBarItemManager {
         }
 
         let idsBeforeClick = Set(Bridging.getWindowList(option: .onScreen))
+        let clickPID = clickItem.sourcePID ?? clickItem.ownerPID
 
         do {
-            try await click(item: clickItem, with: mouseButton, skipInputPause: true)
+            // Single attempt: the item is already at a known-good position with
+            // fresh bounds. If it fails, fall through to the fallback path below
+            // rather than spending 3× the semaphore timeout here.
+            try await click(item: clickItem, with: mouseButton, skipInputPause: true, maxAttempts: 1)
         } catch {
-            MenuBarItemManager.diagLog.error("Error clicking item: \(error)")
-            return
+            MenuBarItemManager.diagLog.error("Error clicking item (first attempt): \(error) — attempting fallback click")
+
+            // Fallback: re-fetch the item from the live window list so the
+            // click targets a fresh MenuBarItem with current windowID and
+            // bounds, rather than the potentially stale pre-click struct.
+            let fallbackItems = await MenuBarItem.getMenuBarItems(on: resolvedDisplayID, option: .onScreen)
+            let fallbackItem = fallbackItems.first(where: { $0.windowID == clickItem.windowID }) ??
+                fallbackItems.first(where: {
+                    $0.tag.matchesIgnoringWindowID(clickItem.tag) &&
+                        ($0.sourcePID ?? $0.ownerPID) == (clickItem.sourcePID ?? clickItem.ownerPID)
+                }) ?? clickItem
+
+            // We stay inside temporarilyShow so that idsBeforeClick and context
+            // remain in scope — shownInterfaceWindow can still be captured if
+            // the fallback succeeds, keeping isShowingInterface accurate for
+            // the rehide logic.
+            do {
+                try await click(item: fallbackItem, with: mouseButton, skipInputPause: true)
+            } catch {
+                MenuBarItemManager.diagLog.error("Fallback click also failed for \(item.logString): \(error)")
+                // Icon is visible but both click attempts failed.
+                return .movedButClickFailed
+            }
         }
 
+        // Capture the popup window opened by whichever click path succeeded.
         await eventSleep(for: .milliseconds(100))
         let windowsAfterClick = WindowInfo.createWindows(option: .onScreen)
 
-        let clickPID = clickItem.sourcePID ?? clickItem.ownerPID
         context.shownInterfaceWindow = windowsAfterClick.first { window in
             window.ownerPID == clickPID && !idsBeforeClick.contains(window.windowID)
         }
+
+        return .movedAndClicked
     }
 
     /// Resolves the best move destination for returning a temporarily shown
@@ -3319,13 +3510,37 @@ extension MenuBarItemManager {
                     \(error)
                     """
                 )
+                // Maximum total attempts across all timer rounds.
+                // 3 per-call attempts × 3 timer rounds = 9. Beyond this the
+                // item is permanently stuck (dead PID, broken EventTap, etc.)
+                // and retrying only keeps the event semaphore saturated.
+                let maxTotalRehideAttempts = 9
                 if context.rehideAttempts < 3 {
                     currentContexts.append(context) // Try again immediately.
-                } else {
-                    // Move failed 3 times with the item present. Reset and
-                    // schedule a longer-delay retry.
-                    context.rehideAttempts = 0
+                } else if context.rehideAttempts < maxTotalRehideAttempts {
+                    // Per-call cap reached; schedule a longer-delay retry.
                     failedContexts.append(context)
+                } else {
+                    // Total cap reached — drop this context from same-session retries.
+                    // Overwrite the pendingRelocations entry with a waitForRelaunch
+                    // sentinel so relocatePendingItems() skips move() this session.
+                    // The sentinel encodes the current windowID; when the app
+                    // relaunches its status item gets a new windowID, clearing the
+                    // suppression automatically.
+                    let tagIdentifier = context.tag.tagIdentifier
+                    pendingRelocations[tagIdentifier] = waitForRelaunchValue(
+                        windowID: item.windowID,
+                        section: context.originalSection
+                    )
+                    persistPendingRelocations()
+                    MenuBarItemManager.diagLog.error(
+                        """
+                        Giving up rehide for \(item.logString) after \
+                        \(context.rehideAttempts) total attempts; \
+                        marked waitForRelaunch — relocatePendingItems will \
+                        retry only after app relaunch (new windowID)
+                        """
+                    )
                 }
             }
         }
@@ -3606,7 +3821,33 @@ extension MenuBarItemManager {
             guard !activelyShownTags.contains(tagIdentifier) else {
                 continue
             }
-            guard let targetSection = sectionName(for: sectionString),
+
+            // Handle waitForRelaunch sentinel — item hit the rehide cap this
+            // session. Skip the move unless the app has relaunched (new windowID).
+            if let sentinel = parseWaitForRelaunch(sectionString) {
+                guard let item = items.first(where: { tagIdentifier == $0.tag.tagIdentifier }) else {
+                    // App not running at all — keep the entry for next launch.
+                    continue
+                }
+                if item.windowID == sentinel.windowID {
+                    // Same session / same window — skip to avoid re-saturating
+                    // the event semaphore with a known-broken move.
+                    MenuBarItemManager.diagLog.debug(
+                        "relocatePendingItems: skipping \(item.logString) — waitForRelaunch sentinel active (same windowID)"
+                    )
+                    continue
+                }
+                // WindowID changed — app relaunched. Promote back to a normal
+                // pending relocation so the regular move path runs below.
+                MenuBarItemManager.diagLog.info(
+                    "relocatePendingItems: \(item.logString) has new windowID — clearing waitForRelaunch sentinel"
+                )
+                pendingRelocations[tagIdentifier] = sectionKey(for: sentinel.section)
+                persistPendingRelocations()
+                // Fall through to the normal relocation logic with the promoted value.
+            }
+
+            guard let targetSection = sectionName(for: pendingRelocations[tagIdentifier] ?? sectionString),
                   targetSection != .visible
             else {
                 // Nothing to do if the original section was visible.
