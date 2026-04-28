@@ -62,6 +62,14 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
+      - name: Upload App
+        uses: actions/upload-artifact@v4
+        with:
+          name: thaw-app
+          path: Build/Build/Products/Debug/Thaw.app
+          retention-days: 1
+          if-no-files-found: error
+
       - name: Upload Coverage Only
         uses: actions/upload-artifact@v4
         with:
