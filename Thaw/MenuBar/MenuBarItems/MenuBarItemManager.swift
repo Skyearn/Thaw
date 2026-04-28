@@ -349,7 +349,7 @@ final class MenuBarItemManager: ObservableObject {
         var allCurrentIdentifiers = Set<String>()
         var allCurrentBaseIdentifiers = Set<String>()
         for section in MenuBarSection.Name.allCases {
-            for item in cache[section] where !item.isControlItem && item.tag.instanceIndex == 0 && item.sourcePID != nil {
+            for item in cache[section] where !item.isControlItem && item.tag.instanceIndex == 0 {
                 let uniqueID = item.uniqueIdentifier
                 allCurrentIdentifiers.insert(uniqueID)
                 // Also track base identifier (without instanceIndex) to handle
@@ -362,7 +362,7 @@ final class MenuBarItemManager: ObservableObject {
         for section in MenuBarSection.Name.allCases {
             // Start with current identifiers for this section (only primary items)
             var identifiers = cache[section]
-                .filter { !$0.isControlItem && $0.tag.instanceIndex == 0 && $0.sourcePID != nil }
+                .filter { !$0.isControlItem && $0.tag.instanceIndex == 0 }
                 .map(\.uniqueIdentifier)
 
             // Add identifiers from saved sections that are NOT currently in the cache
@@ -1304,10 +1304,20 @@ extension MenuBarItemManager {
             isRestoringItemOrderTimestamp = nil
         }
 
+        let isAlwaysHiddenControlTemporarilyMissing =
+            appState?.settings.advanced.enableAlwaysHiddenSection == true &&
+            context.controlItems.alwaysHidden == nil
+
         if !isRestoringItemOrder, !isResettingLayout, !isInStartupSettling,
            temporarilyShownItemContexts.isEmpty
         {
-            saveSectionOrder(from: context.cache)
+            if isAlwaysHiddenControlTemporarilyMissing {
+                MenuBarItemManager.diagLog.warning(
+                    "Skipping saveSectionOrder because the always-hidden control item is temporarily missing"
+                )
+            } else {
+                saveSectionOrder(from: context.cache)
+            }
         }
         MenuBarItemManager.diagLog.debug("Updated menu bar item cache: visible=\(context.cache[.visible].count), hidden=\(context.cache[.hidden].count), alwaysHidden=\(context.cache[.alwaysHidden].count)")
     }
