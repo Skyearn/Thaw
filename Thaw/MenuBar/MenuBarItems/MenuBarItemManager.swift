@@ -8,6 +8,7 @@
 
 import Cocoa
 import Combine
+@preconcurrency import CoreGraphics
 import os.lock
 
 /// Simple actor-based semaphore to prevent overlapping operations
@@ -86,6 +87,16 @@ actor SimpleSemaphore {
         } else {
             value += 1
         }
+    }
+
+    /// Resets the semaphore to a given value, cancelling all pending waiters.
+    /// Use ONLY as a last resort when the semaphore is suspected to be leaked.
+    func reset(to value: Int = 1) {
+        for waiter in waiters {
+            waiter.continuation.resume(throwing: CancellationError())
+        }
+        waiters.removeAll()
+        self.value = value
     }
 }
 
@@ -483,11 +494,10 @@ final class MenuBarItemManager: ObservableObject {
         section: MenuBarSection.Name,
         arrangedViews: [LayoutBarArrangedView]
     ) {
-        let resolvedSection: MenuBarSection.Name
-        if section == .alwaysHidden, appState?.settings.advanced.enableAlwaysHiddenSection != true {
-            resolvedSection = .hidden
+        let resolvedSection: MenuBarSection.Name = if section == .alwaysHidden, appState?.settings.advanced.enableAlwaysHiddenSection != true {
+            .hidden
         } else {
-            resolvedSection = section
+            section
         }
 
         let updatedPlacement: NewItemsPlacement
@@ -561,12 +571,11 @@ final class MenuBarItemManager: ObservableObject {
         let clampedToHidden = preferredSection == .alwaysHidden && alwaysHiddenDisabled
         let resolvedSection: MenuBarSection.Name = clampedToHidden ? .hidden : preferredSection
 
-        let adjusted: NewItemsPlacement
-        if clampedToHidden {
+        let adjusted = if clampedToHidden {
             if let rightmostHiddenItem = itemCache[.hidden].first(
                 where: { !$0.isControlItem && $0.tag.instanceIndex == 0 }
             ) {
-                adjusted = NewItemsPlacement(
+                NewItemsPlacement(
                     sectionKey: sectionKey(for: resolvedSection),
                     anchorIdentifier: persistedNewItemsAnchorIdentifier(for: rightmostHiddenItem),
                     relation: .leftOfAnchor
@@ -575,14 +584,14 @@ final class MenuBarItemManager: ObservableObject {
                 // Clamping, but the hidden section is empty. Drop the
                 // stale alwaysHidden anchor and fall back to the section
                 // default so a later re-save doesn't resurface it.
-                adjusted = NewItemsPlacement(
+                NewItemsPlacement(
                     sectionKey: sectionKey(for: resolvedSection),
                     anchorIdentifier: nil,
                     relation: .sectionDefault
                 )
             }
         } else {
-            adjusted = NewItemsPlacement(
+            NewItemsPlacement(
                 sectionKey: sectionKey(for: resolvedSection),
                 anchorIdentifier: placement.anchorIdentifier,
                 relation: placement.relation
@@ -814,8 +823,8 @@ final class MenuBarItemManager: ObservableObject {
 
                 await cacheItemsRegardless(skipRecentMoveCheck: true, resolveSourcePID: true)
                 let managedCount = itemCache.managedItems.count
-                let unresolved = itemCache.managedItems.filter { $0.sourcePID == nil }.count
-                if managedCount > 0 && unresolved <= 1 {
+                let unresolved = itemCache.managedItems.count(where: { $0.sourcePID == nil })
+                if managedCount > 0, unresolved <= 1 {
                     MenuBarItemManager.diagLog.debug(
                         "performSetup: sourcePIDs resolved (\(unresolved) nil, \(managedCount) items), ending settling early"
                     )
@@ -966,7 +975,7 @@ final class MenuBarItemManager: ObservableObject {
 
 extension MenuBarItemManager {
     /// An actor that manages menu bar item cache operations.
-    private final actor CacheActor {
+    private final class CacheActor {
         /// Stored task for the current cache operation.
         private var cacheTask: Task<Void, Never>?
 
@@ -980,13 +989,10 @@ extension MenuBarItemManager {
         /// If a task from a previous call to this method is currently
         /// running, that task is cancelled and replaced.
         func runCacheTask(_ operation: @escaping () async -> Void) async {
-            if let existing = cacheTask.take() {
-                existing.cancel()
-                _ = await existing.value
-            }
-            let task = Task(operation: operation)
-            cacheTask = task
-            await task.value
+            cacheTask?.cancel()
+            _ = await cacheTask?.value
+            cacheTask = nil
+            await operation()
         }
 
         /// Updates the list of cached menu bar item window identifiers.
@@ -1156,16 +1162,17 @@ extension MenuBarItemManager {
         var cache: ItemCache
         var temporarilyShownItems = [(MenuBarItem, MoveDestination)]()
         var relocatedItems = [MenuBarItem]()
-
-        private(set) lazy var hiddenControlItemBounds = bestBounds(for: controlItems.hidden)
-        private(set) lazy var alwaysHiddenControlItemBounds = controlItems.alwaysHidden.map(bestBounds)
+        let hiddenControlItemBounds: CGRect
+        let alwaysHiddenControlItemBounds: [CGRect]
 
         init(controlItems: ControlItemPair, displayID: CGDirectDisplayID?) {
             self.controlItems = controlItems
             self.cache = ItemCache(displayID: displayID)
+            self.hiddenControlItemBounds = Self.bestBounds(for: controlItems.hidden)
+            self.alwaysHiddenControlItemBounds = controlItems.alwaysHidden.map { [Self.bestBounds(for: $0)] } ?? []
         }
 
-        func bestBounds(for item: MenuBarItem) -> CGRect {
+        private static func bestBounds(for item: MenuBarItem) -> CGRect {
             Bridging.getWindowBounds(for: item.windowID) ?? item.bounds
         }
 
@@ -1186,26 +1193,23 @@ extension MenuBarItemManager {
         }
 
         mutating func findSection(for item: MenuBarItem) -> MenuBarSection.Name? {
-            lazy var itemBounds = bestBounds(for: item)
-            return MenuBarSection.Name.allCases.first { section in
-                switch section {
-                case .visible:
-                    return itemBounds.minX >= hiddenControlItemBounds.maxX
-                case .hidden:
-                    if let alwaysHiddenControlItemBounds {
-                        return itemBounds.maxX <= hiddenControlItemBounds.minX &&
-                            itemBounds.minX >= alwaysHiddenControlItemBounds.maxX
-                    } else {
-                        return itemBounds.maxX <= hiddenControlItemBounds.minX
+            let itemBounds = Self.bestBounds(for: item)
+            if itemBounds.minX >= hiddenControlItemBounds.maxX {
+                return .visible
+            }
+            if itemBounds.maxX <= hiddenControlItemBounds.minX {
+                if let alwaysHiddenBounds = alwaysHiddenControlItemBounds.first {
+                    if itemBounds.minX >= alwaysHiddenBounds.maxX {
+                        return .hidden
                     }
-                case .alwaysHidden:
-                    if let alwaysHiddenControlItemBounds {
-                        return itemBounds.maxX <= alwaysHiddenControlItemBounds.minX
-                    } else {
-                        return false
+                    if itemBounds.maxX <= alwaysHiddenBounds.minX {
+                        return .alwaysHidden
                     }
+                } else {
+                    return .hidden
                 }
             }
+            return nil
         }
     }
 
@@ -1336,240 +1340,235 @@ extension MenuBarItemManager {
         MenuBarItemManager.diagLog.debug(
             "cacheItemsRegardless: entering (skipRecentMoveCheck=\(skipRecentMoveCheck), hasCurrentItemWindowIDs=\(currentItemWindowIDs != nil), resolveSourcePID=\(resolveSourcePID))"
         )
-        await cacheActor.runCacheTask { [weak self] in
-            defer {
-                self?.backgroundCacheContinuation?.resume()
-                self?.backgroundCacheContinuation = nil
-            }
+        defer {
+            backgroundCacheContinuation?.resume()
+            backgroundCacheContinuation = nil
+        }
 
-            guard let self else {
-                MenuBarItemManager.diagLog.warning("cacheItemsRegardless: self is nil, aborting")
-                return
-            }
+        guard skipRecentMoveCheck || !lastMoveOperationOccurred(within: .seconds(1)) else {
+            MenuBarItemManager.diagLog.debug("Skipping menu bar item cache due to recent item movement")
+            return
+        }
 
-            guard skipRecentMoveCheck || !lastMoveOperationOccurred(within: .seconds(1)) else {
-                MenuBarItemManager.diagLog.debug("Skipping menu bar item cache due to recent item movement")
-                return
-            }
+        guard !(appState?.isDraggingMenuBarItem ?? false) else {
+            MenuBarItemManager.diagLog.debug("Skipping menu bar item cache: user is cmd-dragging")
+            return
+        }
 
-            guard !(appState?.isDraggingMenuBarItem ?? false) else {
-                MenuBarItemManager.diagLog.debug("Skipping menu bar item cache: user is cmd-dragging")
-                return
-            }
+        let previousWindowIDs = cacheActor.cachedItemWindowIDs
+        let displayID = Bridging.getActiveMenuBarDisplayID()
+        MenuBarItemManager.diagLog.debug("cacheItemsRegardless: displayID=\(displayID.map { "\($0)" } ?? "nil"), previousWindowIDs count=\(previousWindowIDs.count)")
 
-            let previousWindowIDs = await cacheActor.cachedItemWindowIDs
-            let displayID = Bridging.getActiveMenuBarDisplayID()
-            MenuBarItemManager.diagLog.debug("cacheItemsRegardless: displayID=\(displayID.map { "\($0)" } ?? "nil"), previousWindowIDs count=\(previousWindowIDs.count)")
+        var items = await MenuBarItem.getMenuBarItems(
+            option: .activeSpace,
+            resolveSourcePID: resolveSourcePID
+        )
 
-            var items = await MenuBarItem.getMenuBarItems(
+        if items.isEmpty {
+            // Retry once after a small delay if we got zero items. This can happen
+            // due to transient WindowServer glitches or during display reconfigurations.
+            MenuBarItemManager.diagLog.warning("cacheItemsRegardless: getMenuBarItems returned ZERO items, retrying in 250ms...")
+            try? await Task.sleep(for: .milliseconds(250))
+            items = await MenuBarItem.getMenuBarItems(
                 option: .activeSpace,
                 resolveSourcePID: resolveSourcePID
             )
+        }
 
-            if items.isEmpty {
-                // Retry once after a small delay if we got zero items. This can happen
-                // due to transient WindowServer glitches or during display reconfigurations.
-                MenuBarItemManager.diagLog.warning("cacheItemsRegardless: getMenuBarItems returned ZERO items, retrying in 250ms...")
-                try? await Task.sleep(for: .milliseconds(250))
-                items = await MenuBarItem.getMenuBarItems(
-                    option: .activeSpace,
-                    resolveSourcePID: resolveSourcePID
-                )
-            }
+        MenuBarItemManager.diagLog.debug("cacheItemsRegardless: getMenuBarItems returned \(items.count) items")
 
-            MenuBarItemManager.diagLog.debug("cacheItemsRegardless: getMenuBarItems returned \(items.count) items")
-
-            // When sourcePID resolution changes an item's identifier (e.g. from
-            // com.apple.controlcenter:Item-0:4 to pl.maketheweb.cleanshotx:Item-0),
-            // the new identifier won't be in knownItemIdentifiers. Seed it now so
-            // the item isn't treated as a "new" item by relocateNewLeftmostItems.
-            if !previousWindowIDs.isEmpty {
-                for item in items where previousWindowIDs.contains(item.windowID) {
-                    let identifier = "\(item.tag.namespace):\(item.tag.title)"
-                    if !knownItemIdentifiers.contains(identifier) {
-                        knownItemIdentifiers.insert(identifier)
-                    }
+        // When sourcePID resolution changes an item's identifier (e.g. from
+        // com.apple.controlcenter:Item-0:4 to pl.maketheweb.cleanshotx:Item-0),
+        // the new identifier won't be in knownItemIdentifiers. Seed it now so
+        // the item isn't treated as a "new" item by relocateNewLeftmostItems.
+        if !previousWindowIDs.isEmpty {
+            for item in items where previousWindowIDs.contains(item.windowID) {
+                let identifier = "\(item.tag.namespace):\(item.tag.title)"
+                if !knownItemIdentifiers.contains(identifier) {
+                    knownItemIdentifiers.insert(identifier)
                 }
-                persistKnownItemIdentifiers()
             }
+            persistKnownItemIdentifiers()
+        }
 
-            guard !Task.isCancelled else {
-                MenuBarItemManager.diagLog.debug("cacheItemsRegardless: cancelled after getMenuBarItems")
-                return
-            }
+        guard !Task.isCancelled else {
+            MenuBarItemManager.diagLog.debug("cacheItemsRegardless: cancelled after getMenuBarItems")
+            return
+        }
 
-            if items.isEmpty {
-                MenuBarItemManager.diagLog.error("cacheItemsRegardless: getMenuBarItems returned ZERO items even after retry — this is the root cause of 'Loading menu bar items' being stuck")
-            }
+        if items.isEmpty {
+            MenuBarItemManager.diagLog.error("cacheItemsRegardless: getMenuBarItems returned ZERO items even after retry — this is the root cause of 'Loading menu bar items' being stuck")
+        }
 
-            let itemWindowIDs = currentItemWindowIDs ?? items.reversed().map { $0.windowID }
-            await cacheActor.updateCachedItemWindowIDs(itemWindowIDs)
+        let itemWindowIDs = currentItemWindowIDs ?? items.reversed().map(\.windowID)
+        cacheActor.updateCachedItemWindowIDs(itemWindowIDs)
 
+        await MainActor.run {
+            MenuBarItemTag.Namespace.pruneUUIDCache(keeping: Set(itemWindowIDs))
+            self.pruneMoveOperationTimeouts(keeping: Set(items.map(\.tag)))
+            self.pruneClickOperationTimeouts(keeping: Set(items.map(\.tag)))
+        }
+
+        // Obtain window IDs from the actual ControlItem objects so the
+        // fallback lookup in ControlItemPair can match by window ID when
+        // the tag-based and title-based lookups fail (macOS 26+).
+        let hiddenControlItemWID: CGWindowID? = appState?.menuBarManager
+            .controlItem(withName: .hidden)?.window
+            .flatMap { CGWindowID(exactly: $0.windowNumber) }
+        let alwaysHiddenControlItemWID: CGWindowID? = appState?.menuBarManager
+            .controlItem(withName: .alwaysHidden)?.window
+            .flatMap { CGWindowID(exactly: $0.windowNumber) }
+
+        guard let controlItems = ControlItemPair(
+            items: &items,
+            hiddenControlItemWindowID: hiddenControlItemWID,
+            alwaysHiddenControlItemWindowID: alwaysHiddenControlItemWID
+        ) else {
+            // ???: Is clearing the cache the best thing to do here?
+            MenuBarItemManager.diagLog.warning("cacheItemsRegardless: Missing control item for hidden section (expected tag: \(MenuBarItemTag.hiddenControlItem)), clearing cache. Items remaining: \(items.count), windowIDs: \(itemWindowIDs.count). hiddenControlItemWID=\(hiddenControlItemWID.map { "\($0)" } ?? "nil"), alwaysHiddenControlItemWID=\(alwaysHiddenControlItemWID.map { "\($0)" } ?? "nil")")
             await MainActor.run {
-                MenuBarItemTag.Namespace.pruneUUIDCache(keeping: Set(itemWindowIDs))
-                self.pruneMoveOperationTimeouts(keeping: Set(items.map(\.tag)))
-                self.pruneClickOperationTimeouts(keeping: Set(items.map(\.tag)))
+                self.areControlItemsMissing = true
             }
+            itemCache = ItemCache(displayID: nil)
+            return
+        }
 
-            // Obtain window IDs from the actual ControlItem objects so the
-            // fallback lookup in ControlItemPair can match by window ID when
-            // the tag-based and title-based lookups fail (macOS 26+).
-            let hiddenControlItemWID: CGWindowID? = appState?.menuBarManager
-                .controlItem(withName: .hidden)?.window
-                .flatMap { CGWindowID(exactly: $0.windowNumber) }
-            let alwaysHiddenControlItemWID: CGWindowID? = appState?.menuBarManager
-                .controlItem(withName: .alwaysHidden)?.window
-                .flatMap { CGWindowID(exactly: $0.windowNumber) }
+        await MainActor.run {
+            self.areControlItemsMissing = false
+        }
 
-            guard let controlItems = ControlItemPair(
-                items: &items,
-                hiddenControlItemWindowID: hiddenControlItemWID,
-                alwaysHiddenControlItemWindowID: alwaysHiddenControlItemWID
-            ) else {
-                // ???: Is clearing the cache the best thing to do here?
-                MenuBarItemManager.diagLog.warning("cacheItemsRegardless: Missing control item for hidden section (expected tag: \(MenuBarItemTag.hiddenControlItem)), clearing cache. Items remaining: \(items.count), windowIDs: \(itemWindowIDs.count). hiddenControlItemWID=\(hiddenControlItemWID.map { "\($0)" } ?? "nil"), alwaysHiddenControlItemWID=\(alwaysHiddenControlItemWID.map { "\($0)" } ?? "nil")")
-                await MainActor.run {
-                    self.areControlItemsMissing = true
+        MenuBarItemManager.diagLog.debug("cacheItemsRegardless: found control items, hidden windowID=\(controlItems.hidden.windowID), alwaysHidden=\(controlItems.alwaysHidden.map { "\($0.windowID)" } ?? "nil")")
+
+        guard !Task.isCancelled else {
+            MenuBarItemManager.diagLog.debug("cacheItemsRegardless: cancelled after control item discovery")
+            return
+        }
+
+        await enforceControlItemOrder(controlItems: controlItems)
+
+        guard !Task.isCancelled else {
+            MenuBarItemManager.diagLog.debug("cacheItemsRegardless: cancelled before relocateNewLeftmostItems")
+            return
+        }
+
+        if await relocateNewLeftmostItems(
+            items,
+            controlItems: controlItems,
+            previousWindowIDs: previousWindowIDs
+        ) {
+            MenuBarItemManager.diagLog.debug("Relocated new leftmost items; scheduling recache")
+            let continuation = self.backgroundCacheContinuation
+            self.backgroundCacheContinuation = nil
+            Task { [weak self] in
+                try? await Task.sleep(for: MenuBarItemManager.uiSettleDelay)
+                await self?.cacheItemsRegardless(skipRecentMoveCheck: true)
+                continuation?.resume()
+            }
+            return
+        }
+
+        if await relocatePendingItems(items, controlItems: controlItems) {
+            MenuBarItemManager.diagLog.debug("Relocated pending temporarily-shown items; scheduling recache")
+            let continuation = self.backgroundCacheContinuation
+            self.backgroundCacheContinuation = nil
+            Task { [weak self] in
+                try? await Task.sleep(for: MenuBarItemManager.uiSettleDelay)
+                await self?.cacheItemsRegardless(skipRecentMoveCheck: true)
+                continuation?.resume()
+            }
+            return
+        }
+
+        // Skip all restore logic during the startup settling period.
+        // The settling period prevents cascading icon moves when many apps
+        // load at login or restart in quick succession (app update checks).
+        // A final cacheItemsRegardless() after the period ends handles restore.
+        guard !isInStartupSettling else {
+            await uncheckedCacheItems(items: items, controlItems: controlItems, displayID: displayID)
+            // Absorb items that appear during settling into the profile
+            // snapshot so they aren't treated as late arrivals afterwards.
+            if activeProfileLayout != nil {
+                for item in items where !item.isControlItem {
+                    profileSortedItemIdentifiers.insert(item.uniqueIdentifier)
                 }
-                itemCache = ItemCache(displayID: nil)
-                return
             }
+            MenuBarItemManager.diagLog.debug("cacheItemsRegardless: startup settling active, skipping restore")
+            return
+        }
 
-            await MainActor.run {
-                self.areControlItemsMissing = false
+        // Cross-section restore: move items back to their saved section
+        // before restoreSavedItemOrder handles within-section reordering.
+        // Set the flag before calling so that any intermediate cache
+        // updates during move() don't overwrite the saved section order.
+        isRestoringItemOrder = true
+        isRestoringItemOrderTimestamp = Date()
+        let didRestoreSections = await restoreItemsToSavedSections(
+            items,
+            controlItems: controlItems,
+            previousWindowIDs: previousWindowIDs
+        )
+        if didRestoreSections {
+            MenuBarItemManager.diagLog.debug("Restored item to saved section; scheduling recache")
+            let continuation = self.backgroundCacheContinuation
+            self.backgroundCacheContinuation = nil
+            Task { [weak self] in
+                try? await Task.sleep(for: MenuBarItemManager.uiSettleDelay)
+                await self?.cacheItemsRegardless(skipRecentMoveCheck: true)
+                self?.isRestoringItemOrder = false
+                continuation?.resume()
+                try? await Task.sleep(for: MenuBarItemManager.uiSettleDelay)
+                await self?.cacheItemsIfNeeded()
             }
+            return
+        }
+        // Note: isRestoringItemOrder remains true here so that if a concurrent
+        // cache call occurs (e.g., from app launch notification), it won't
+        // prematurely reset the flag and allow saveSectionOrder to run while
+        // we're still in the cooldown period from previous moves.
 
-            MenuBarItemManager.diagLog.debug("cacheItemsRegardless: found control items, hidden windowID=\(controlItems.hidden.windowID), alwaysHidden=\(controlItems.alwaysHidden.map { "\($0.windowID)" } ?? "nil")")
+        let didRestoreOrder = await restoreSavedItemOrder(
+            items,
+            controlItems: controlItems,
+            previousWindowIDs: previousWindowIDs
+        )
 
-            guard !Task.isCancelled else {
-                MenuBarItemManager.diagLog.debug("cacheItemsRegardless: cancelled after control item discovery")
-                return
-            }
-
-            await enforceControlItemOrder(controlItems: controlItems)
-
-            guard !Task.isCancelled else {
-                MenuBarItemManager.diagLog.debug("cacheItemsRegardless: cancelled before relocateNewLeftmostItems")
-                return
-            }
-
-            if await relocateNewLeftmostItems(
-                items,
-                controlItems: controlItems,
-                previousWindowIDs: previousWindowIDs
-            ) {
-                MenuBarItemManager.diagLog.debug("Relocated new leftmost items; scheduling recache")
-                let continuation = self.backgroundCacheContinuation
-                self.backgroundCacheContinuation = nil
-                Task { [weak self] in
-                    try? await Task.sleep(for: MenuBarItemManager.uiSettleDelay)
-                    await self?.cacheItemsRegardless(skipRecentMoveCheck: true)
-                    continuation?.resume()
-                }
-                return
-            }
-
-            if await relocatePendingItems(items, controlItems: controlItems) {
-                MenuBarItemManager.diagLog.debug("Relocated pending temporarily-shown items; scheduling recache")
-                let continuation = self.backgroundCacheContinuation
-                self.backgroundCacheContinuation = nil
-                Task { [weak self] in
-                    try? await Task.sleep(for: MenuBarItemManager.uiSettleDelay)
-                    await self?.cacheItemsRegardless(skipRecentMoveCheck: true)
-                    continuation?.resume()
-                }
-                return
-            }
-
-            // Skip all restore logic during the startup settling period.
-            // The settling period prevents cascading icon moves when many apps
-            // load at login or restart in quick succession (app update checks).
-            // A final cacheItemsRegardless() after the period ends handles restore.
-            guard !isInStartupSettling else {
-                await uncheckedCacheItems(items: items, controlItems: controlItems, displayID: displayID)
-                // Absorb items that appear during settling into the profile
-                // snapshot so they aren't treated as late arrivals afterwards.
-                if activeProfileLayout != nil {
-                    for item in items where !item.isControlItem {
-                        profileSortedItemIdentifiers.insert(item.uniqueIdentifier)
-                    }
-                }
-                MenuBarItemManager.diagLog.debug("cacheItemsRegardless: startup settling active, skipping restore")
-                return
-            }
-
-            // Cross-section restore: move items back to their saved section
-            // before restoreSavedItemOrder handles within-section reordering.
-            // Set the flag before calling so that any intermediate cache
-            // updates during move() don't overwrite the saved section order.
+        if didRestoreOrder {
+            // Keep isRestoringItemOrder true through the recache to prevent
+            // saving intermediate item positions while macOS settles the moves.
             isRestoringItemOrder = true
             isRestoringItemOrderTimestamp = Date()
-            let didRestoreSections = await restoreItemsToSavedSections(
-                items,
-                controlItems: controlItems,
-                previousWindowIDs: previousWindowIDs
-            )
-            if didRestoreSections {
-                MenuBarItemManager.diagLog.debug("Restored item to saved section; scheduling recache")
-                let continuation = self.backgroundCacheContinuation
-                self.backgroundCacheContinuation = nil
-                Task { [weak self] in
-                    try? await Task.sleep(for: MenuBarItemManager.uiSettleDelay)
-                    await self?.cacheItemsRegardless(skipRecentMoveCheck: true)
-                    self?.isRestoringItemOrder = false
-                    continuation?.resume()
-                    try? await Task.sleep(for: MenuBarItemManager.uiSettleDelay)
-                    await self?.cacheItemsIfNeeded()
-                }
-                return
+            MenuBarItemManager.diagLog.debug("Restored saved item order; scheduling recache")
+            let continuation = self.backgroundCacheContinuation
+            self.backgroundCacheContinuation = nil
+            Task { [weak self] in
+                try? await Task.sleep(for: MenuBarItemManager.uiSettleDelay)
+                await self?.cacheItemsRegardless(skipRecentMoveCheck: true)
+                self?.isRestoringItemOrder = false
+                continuation?.resume()
+                // Pick up items that appeared during the lock period
+                // (e.g. a second app launching concurrently).
+                try? await Task.sleep(for: MenuBarItemManager.uiSettleDelay)
+                await self?.cacheItemsIfNeeded()
             }
-            // Note: isRestoringItemOrder remains true here so that if a concurrent
-            // cache call occurs (e.g., from app launch notification), it won't
-            // prematurely reset the flag and allow saveSectionOrder to run while
-            // we're still in the cooldown period from previous moves.
+            return
+        }
 
-            let didRestoreOrder = await restoreSavedItemOrder(
-                items,
-                controlItems: controlItems,
-                previousWindowIDs: previousWindowIDs
-            )
+        // No restore happened — reset flag so saveSectionOrder can persist
+        // the current cache state (handles user manual moves via Layout Bar
+        // that would otherwise never be recorded).
+        isRestoringItemOrder = false
+        isRestoringItemOrderTimestamp = nil
 
-            if didRestoreOrder {
-                // Keep isRestoringItemOrder true through the recache to prevent
-                // saving intermediate item positions while macOS settles the moves.
-                isRestoringItemOrder = true
-                isRestoringItemOrderTimestamp = Date()
-                MenuBarItemManager.diagLog.debug("Restored saved item order; scheduling recache")
-                let continuation = self.backgroundCacheContinuation
-                self.backgroundCacheContinuation = nil
-                Task { [weak self] in
-                    try? await Task.sleep(for: MenuBarItemManager.uiSettleDelay)
-                    await self?.cacheItemsRegardless(skipRecentMoveCheck: true)
-                    self?.isRestoringItemOrder = false
-                    continuation?.resume()
-                    // Pick up items that appeared during the lock period
-                    // (e.g. a second app launching concurrently).
-                    try? await Task.sleep(for: MenuBarItemManager.uiSettleDelay)
-                    await self?.cacheItemsIfNeeded()
-                }
-                return
-            }
+        await uncheckedCacheItems(items: items, controlItems: controlItems, displayID: displayID)
 
-            await uncheckedCacheItems(items: items, controlItems: controlItems, displayID: displayID)
-
-            // Reset the flag since no restore happened in this cache cycle.
-            // This must be done before the function ends so that saveSectionOrder
-            // can run for future caches.
-            isRestoringItemOrder = false
-
-            // Detect late-arriving items that belong to the active profile.
-            // If new items appeared since the last profile apply/re-sort,
-            // schedule a debounced re-sort to place them correctly.
-            if activeProfileLayout != nil,
-               !activeProfileItemIdentifiers.isEmpty,
-               profileResortTask == nil,
-               !isApplyingProfileLayout
-            {
+        // Detect late-arriving items that belong to the active profile.
+        if activeProfileLayout != nil,
+           !activeProfileItemIdentifiers.isEmpty
+        {
+            await MainActor.run {
+                guard profileResortTask == nil,
+                      !isApplyingProfileLayout
+                else { return }
                 let currentIdentifiers = Set(
                     items
                         .filter { !$0.isControlItem }
@@ -1583,7 +1582,9 @@ extension MenuBarItemManager {
                     scheduleProfileResort()
                 }
             }
+        }
 
+        await MainActor.run {
             MenuBarItemManager.diagLog.debug("cacheItemsRegardless: finished, cache now has \(self.itemCache.managedItems.count) managed items")
         }
     }
@@ -1596,7 +1597,7 @@ extension MenuBarItemManager {
     /// arranging them into valid positions if needed.
     func cacheItemsIfNeeded() async {
         let itemWindowIDs = Bridging.getMenuBarWindowList(option: [.itemsOnly, .activeSpace])
-        let cachedIDs = await cacheActor.cachedItemWindowIDs
+        let cachedIDs = cacheActor.cachedItemWindowIDs
         if cachedIDs != itemWindowIDs {
             MenuBarItemManager.diagLog.debug("cacheItemsIfNeeded: window IDs changed (\(cachedIDs.count) cached vs \(itemWindowIDs.count) current), triggering recache")
             await cacheItemsRegardless(itemWindowIDs)
@@ -1767,15 +1768,15 @@ extension MenuBarItemManager {
         with stateID: CGEventSourceStateID = .hidSystemState
     ) throws -> CGEventSource {
         enum Context {
-            static var cache = [CGEventSourceStateID: CGEventSource]()
+            static let cache = OSAllocatedUnfairLock(initialState: [CGEventSourceStateID: CGEventSource]())
         }
-        if let source = Context.cache[stateID] {
+        if let source = Context.cache.withLock({ $0[stateID] }) {
             return source
         }
         guard let source = CGEventSource(stateID: stateID) else {
             throw EventError.invalidEventSource
         }
-        Context.cache[stateID] = source
+        Context.cache.withLock { $0[stateID] = source }
         return source
     }
 
@@ -1871,33 +1872,16 @@ extension MenuBarItemManager {
 
     private nonisolated func makeContinuationTask(
         eventTaps: [EventTap],
-        state: EventContinuationState,
-        continuation: CheckedContinuation<Void, any Error>,
+        state _: EventContinuationState,
+        continuation _: CheckedContinuation<Void, any Error>,
         entryEvent: CGEvent,
         firstLocation: EventTap.Location
     ) -> Task<Void, Never> {
         Task {
-            await withTaskCancellationHandler {
-                // Check cancellation before enabling taps
-                guard !Task.isCancelled else {
-                    disableEventTaps(eventTaps)
-                    resumeCancellationIfNeeded(state: state, continuation: continuation)
-                    return
-                }
-                for eventTap in eventTaps {
-                    eventTap.enable()
-                }
-                // Check cancellation before posting event
-                guard !Task.isCancelled else {
-                    disableEventTaps(eventTaps)
-                    resumeCancellationIfNeeded(state: state, continuation: continuation)
-                    return
-                }
-                entryEvent.post(to: firstLocation)
-            } onCancel: {
-                disableEventTaps(eventTaps)
-                resumeCancellationIfNeeded(state: state, continuation: continuation)
+            for eventTap in eventTaps {
+                eventTap.enable()
             }
+            entryEvent.post(to: firstLocation)
         }
     }
 
@@ -2104,20 +2088,7 @@ extension MenuBarItemManager {
         let secondLocation = EventTap.Location.sessionEventTap
 
         let countHolder = OSAllocatedUnfairLock(initialState: count)
-        var eventTaps = [EventTap]()
 
-        defer {
-            for tap in eventTaps {
-                tap.invalidate()
-            }
-        }
-
-        // Outer-scope locks so the onCancel handler can unblock the stuck
-        // continuation directly. innerTask completes almost immediately after
-        // enabling the EventTaps; by the time the timeout fires, cancelling
-        // innerTask is a no-op. The outer onCancel must therefore resume the
-        // continuation itself to prevent withThrowingTaskGroup from waiting
-        // forever and holding eventSemaphore for 5 seconds.
         let didResume = OSAllocatedUnfairLock(initialState: false)
         let continuationHolder = OSAllocatedUnfairLock<CheckedContinuation<Void, any Error>?>(initialState: nil)
         let innerTaskHolder = OSAllocatedUnfairLock<Task<Void, Never>?>(initialState: nil)
@@ -2137,6 +2108,12 @@ extension MenuBarItemManager {
         )
 
         let timeoutTask = Task(timeout: timeout * count) {
+            var eventTaps = [EventTap]()
+            defer {
+                for tap in eventTaps {
+                    tap.invalidate()
+                }
+            }
             try await withTaskCancellationHandler {
                 try await awaitEventContinuation(
                     kind: kind,
@@ -2430,16 +2407,25 @@ extension MenuBarItemManager {
         on displayID: CGDirectDisplayID,
         warpCursorAfter: Bool = true
     ) async throws {
+        var acquiredSemaphore = false
         do {
             try await eventSemaphore.wait(timeout: .milliseconds(3500))
+            acquiredSemaphore = true
         } catch is SimpleSemaphore.TimeoutError {
-            // wait(timeout:) already restores the semaphore count via cancelWaiter
-            // when it times out — do NOT call signal() here or the semaphore
-            // is over-released and two callers can hold it simultaneously.
             MenuBarItemManager.diagLog.error("eventSemaphore timed out (3.5s) in postMoveEvents")
-            throw EventError.cannotComplete
+            await eventSemaphore.reset(to: 1)
+            do {
+                try await eventSemaphore.wait(timeout: .milliseconds(3500))
+                acquiredSemaphore = true
+            } catch is SimpleSemaphore.TimeoutError {
+                throw EventError.cannotComplete
+            }
         }
-        defer { Task.detached { [eventSemaphore] in await eventSemaphore.signal() } }
+        defer {
+            if acquiredSemaphore {
+                Task.detached { [eventSemaphore] in await eventSemaphore.signal() }
+            }
+        }
 
         // Fast-fail if the target process is dead. CGEvent.tapCreateForPid
         // silently produces an invalid Mach port for dead PIDs, causing every
@@ -2481,6 +2467,7 @@ extension MenuBarItemManager {
         MenuBarItemManager.diagLog.debug("Move operation timeout: \(timeout)")
 
         lastMoveOperationTimestamp = .now
+        MouseHelpers.warpCursor(to: targetPoints.start)
         MouseHelpers.hideCursor()
         defer {
             if let mouseLocation {
@@ -2618,13 +2605,12 @@ extension MenuBarItemManager {
         }
 
         // Determine display ID early.
-        let resolvedDisplayID: CGDirectDisplayID
-        if let displayID = displayID {
-            resolvedDisplayID = displayID
+        let resolvedDisplayID: CGDirectDisplayID = if let displayID {
+            displayID
         } else if let window = appState.hidEventManager.bestScreen(appState: appState) {
-            resolvedDisplayID = window.displayID
+            window.displayID
         } else {
-            resolvedDisplayID = Bridging.getActiveMenuBarDisplayID() ?? CGMainDisplayID()
+            Bridging.getActiveMenuBarDisplayID() ?? CGMainDisplayID()
         }
 
         if !skipInputPause {
@@ -2733,18 +2719,29 @@ extension MenuBarItemManager {
     private func postClickEvents(item: MenuBarItem, mouseButton: CGMouseButton) async throws {
         // Try to acquire semaphore with timeout. 3.5 s covers legitimate slow
         // operations (adaptive click cap is 1000 ms × 2 for double mouseUp =
-        // ~2 s of event work plus overhead). wait(timeout:) already restores
-        // the semaphore count via cancelWaiter on timeout — do NOT call
-        // signal() in the catch block or the semaphore is over-released.
+        // ~2 s of event work plus overhead).
+        var acquiredSemaphore = false
         do {
             try await eventSemaphore.wait(timeout: .milliseconds(3500))
+            acquiredSemaphore = true
         } catch is SimpleSemaphore.TimeoutError {
             MenuBarItemManager.diagLog.error("eventSemaphore timed out (3.5s) in postClickEvents for \(item.logString)")
-            throw EventError.cannotComplete
+            await eventSemaphore.reset(to: 1)
+            do {
+                try await eventSemaphore.wait(timeout: .milliseconds(3500))
+                acquiredSemaphore = true
+            } catch is SimpleSemaphore.TimeoutError {
+                throw EventError.cannotComplete
+            }
         }
-        defer { Task.detached { [eventSemaphore] in await eventSemaphore.signal() } }
+        defer {
+            if acquiredSemaphore {
+                Task.detached { [eventSemaphore] in await eventSemaphore.signal() }
+            }
+        }
 
         let clickPoint = try await getCurrentBounds(for: item).center
+
         let mouseLocation = try getMouseLocation()
         let source = try getEventSource()
 
@@ -2773,6 +2770,13 @@ extension MenuBarItemManager {
             throw EventError.eventCreationFailure(item)
         }
 
+        // Warp the cursor to the click point so the Window Server's hit-test
+        // matches the event coordinates rather than the cursor's current position.
+        MouseHelpers.warpCursor(to: clickPoint)
+        // Small delay to let the Window Server process the warp before posting
+        // the event. Without this, the event can be routed using the cursor's
+        // old position (e.g. the Apple menu) instead of the warped target.
+        try await Task.sleep(for: .milliseconds(10))
         MouseHelpers.hideCursor()
         defer {
             MouseHelpers.warpCursor(to: mouseLocation)
@@ -2964,23 +2968,26 @@ extension MenuBarItemManager {
         }
 
         /// Checks whether the item's owning application has any visible
-        /// popup, menu, or overlay window on screen.
+        /// popup-menu window on screen.
+        ///
+        /// Only matches the pop-up menu level (the level macOS uses for
+        /// menus opened from menu bar items). Status-level and main-menu
+        /// level windows are excluded because those are the menu bar items
+        /// themselves — including the temporarily-shown item we're
+        /// tracking — not popups created by clicking them. A liberal
+        /// "above normal" match was previously used as a catch-all, but
+        /// it matched floating panels, modal levels, and other unrelated
+        /// app windows, keeping `isShowingInterface` true indefinitely
+        /// and preventing rehide.
         private func appHasVisiblePopup() -> Bool {
             let windows = WindowInfo.createWindows(option: .onScreen)
+            let popUpLevel = CGWindowLevelForKey(.popUpMenuWindow)
             return windows.contains { window in
                 guard window.ownerPID == sourcePID else {
                     return false
                 }
-                // Menu-level or status-level windows are popups.
-                if window.isMenuRelated {
-                    return true
-                }
-                // Above-normal layer windows (overlays, popovers) that
-                // belong to the app also count.
-                if window.layer > CGWindowLevelForKey(.normalWindow) {
-                    return true
-                }
-                return false
+                let level = CGWindowLevel(Int32(window.layer))
+                return level == popUpLevel || level == popUpLevel - 1
             }
         }
 
@@ -3100,8 +3107,11 @@ extension MenuBarItemManager {
             }
         }
         // Also rehide when frontmost app changes (smart-ish).
+        // Debounce so rapid app switches (Cmd-Tab spam) collapse to one
+        // rehide attempt instead of queuing a separate Task per change —
+        // each rehide call can do an expensive on-screen window enumeration.
         rehideCancellable = NSWorkspace.shared.publisher(for: \.frontmostApplication)
-            .receive(on: DispatchQueue.main)
+            .debounce(for: .milliseconds(200), scheduler: DispatchQueue.main)
             .sink { [weak self] _ in
                 guard let self else { return }
                 Task { await self.rehideTemporarilyShownItems() }
@@ -3178,7 +3188,7 @@ extension MenuBarItemManager {
                 MenuBarItemManager.diagLog.error(
                     """
                     temporarilyShow: aborting — \(stuckItems.count) item(s) still stuck \
-                    after force-rehide: \(stuckItems.map { $0.tag }). \
+                    after force-rehide: \(stuckItems.map(\.tag)). \
                     Avoiding further semaphore saturation.
                     """
                 )
@@ -3228,10 +3238,9 @@ extension MenuBarItemManager {
 
         // Also store the return destination to preserve ordering
         let neighborTag = returnInfo.destination.targetItem.tag
-        let position: String
-        switch returnInfo.destination {
-        case .leftOfItem: position = "left"
-        case .rightOfItem: position = "right"
+        let position = switch returnInfo.destination {
+        case .leftOfItem: "left"
+        case .rightOfItem: "right"
         }
         pendingReturnDestinations[tagIdentifier] = [
             "neighbor": neighborTag.tagIdentifier,
@@ -3498,7 +3507,7 @@ extension MenuBarItemManager {
         MenuBarItemManager.diagLog.debug("rehideTemporarilyShownItems: started (force=\(force), isCalledFromTemporarilyShow=\(isCalledFromTemporarilyShow))")
 
         if !force {
-            guard !temporarilyShownItemContexts.contains(where: { $0.isShowingInterface }) else {
+            guard !temporarilyShownItemContexts.contains(where: \.isShowingInterface) else {
                 MenuBarItemManager.diagLog.debug("Menu bar item interface is shown, so waiting to rehide")
                 runRehideTimer(for: 3)
                 return
@@ -3636,7 +3645,7 @@ extension MenuBarItemManager {
             MenuBarItemManager.diagLog.error(
                 """
                 Some items failed to rehide; keeping in context for retry: \
-                \(failedContexts.map { $0.tag })
+                \(failedContexts.map(\.tag))
                 """
             )
             temporarilyShownItemContexts.append(contentsOf: failedContexts.reversed())
@@ -3801,7 +3810,7 @@ extension MenuBarItemManager {
 
         // For hideable items, identify a candidate that is new (windowID or
         // tag/namespace) and not already placed/pinned in hidden areas.
-        let hideableLeftmost = leftmostItems.filter { $0.canBeHidden }
+        let hideableLeftmost = leftmostItems.filter(\.canBeHidden)
         let previousIDs = Set(previousWindowIDs)
 
         // Build lookup for saved sections (same logic as restoreItemsToSavedSections).
@@ -3860,13 +3869,13 @@ extension MenuBarItemManager {
             // changed (e.g. sourcePID resolution) but the window existed before.
             // This is an identifier migration, not a genuinely new item.
             let isNewID = previousIDs.isEmpty ? isNewIdentity : !previousIDs.contains(item.windowID)
-            if isNewIdentity && !isNewID {
+            if isNewIdentity, !isNewID {
                 return false
             }
             return notPlacedHidden && (isNewIdentity || isNewID)
         }
         guard let candidate else {
-            if !leftmostItems.isEmpty && savedSectionForIdentifier.isEmpty == false {
+            if !leftmostItems.isEmpty, savedSectionForIdentifier.isEmpty == false {
                 MenuBarItemManager.diagLog.debug("relocateNewLeftmostItems: skipping, items have saved sections (letting restore handle it)")
             }
             return false
@@ -3889,6 +3898,12 @@ extension MenuBarItemManager {
         MenuBarItemManager.diagLog.info(
             "Relocating new item \(candidate.logString) to \(effectiveNewItemsSection.logString)"
         )
+
+        // Skip items with no valid bounds (transient clone windows etc.)
+        guard Bridging.getWindowBounds(for: candidate.windowID) != nil else {
+            MenuBarItemManager.diagLog.warning("Skipping relocation for \(candidate.logString) — no valid bounds, likely transient")
+            return false
+        }
 
         do {
             try await move(
@@ -3923,9 +3938,7 @@ extension MenuBarItemManager {
 
         // Don't interfere with items that are currently temporarily shown —
         // those are handled by the normal rehide flow.
-        let activelyShownTags = Set(temporarilyShownItemContexts.map {
-            $0.tag.tagIdentifier
-        })
+        let activelyShownTags = Set(temporarilyShownItemContexts.map(\.tag.tagIdentifier))
 
         let hiddenBounds = bestBounds(for: controlItems.hidden)
         var didRelocate = false
@@ -4066,25 +4079,51 @@ extension MenuBarItemManager {
         // multiple apps restart in quick succession (e.g. app update checks).
         guard !lastMoveOperationOccurred(within: .seconds(5)) else { return false }
 
-        // Only restore when previous window IDs have disappeared (app restarted).
-        // This prevents undoing the user's manual section moves on regular cache refreshes.
         let currentWindowIDSet = Set(items.map(\.windowID))
         let previousWindowIDSet = Set(previousWindowIDs)
-        guard !previousWindowIDSet.isEmpty && !previousWindowIDSet.isSubset(of: currentWindowIDSet) else {
-            MenuBarItemManager.diagLog.debug("restoreItemsToSavedSections: no app restart detected (window IDs unchanged), skipping")
+
+        // Detect actual window ID changes (some windows disappeared = app restart).
+        let windowIDsChanged = !previousWindowIDSet.isEmpty && !previousWindowIDSet.isSubset(of: currentWindowIDSet)
+
+        // Get current item tags and check if any saved items are present.
+        let currentTags = Set(items.map { "\($0.tag.namespace):\($0.tag.title)" })
+        let savedTags = Set(savedSectionOrder.values.flatMap(\.self))
+        let savedTagsInCurrent = savedTags.intersection(currentTags)
+
+        guard !savedTagsInCurrent.isEmpty else {
+            MenuBarItemManager.diagLog.debug("restoreItemsToSavedSections: no saved items currently present, skipping")
             return false
         }
 
-        // Get current item tags.
-        let currentTags = Set(items.map { "\($0.tag.namespace):\($0.tag.title)" })
-        let savedTags = Set(savedSectionOrder.values.flatMap { $0 })
-        let savedTagsInCurrent = savedTags.intersection(currentTags)
+        // When window IDs haven't changed, scan for items whose current section
+        // differs from their saved section. This handles the case where an app
+        // relaunched with a new window ID spanning two cache passes:
+        //   Pass 1 (terminate): old windowID removed from cachedItemWindowIDs
+        //   Pass 2 (launch):    new windowID appears, guard sees "no restart"
+        //                       because the old ID was already cleaned up.
+        var hasMisplacedItems = false
+        if !windowIDsChanged, !savedSectionOrder.isEmpty {
+            var savedSectionForBaseID = [String: MenuBarSection.Name]()
+            for (sectionKeyString, identifiers) in savedSectionOrder {
+                guard let section = sectionName(for: sectionKeyString) else { continue }
+                for identifier in identifiers {
+                    let baseID = identifier.split(separator: ":", maxSplits: 2).prefix(2).joined(separator: ":")
+                    savedSectionForBaseID[baseID] = section
+                }
+            }
+            var context = CacheContext(controlItems: controlItems, displayID: Bridging.getActiveMenuBarDisplayID())
+            for item in items where !item.isControlItem && item.isMovable && item.canBeHidden && item.tag.instanceIndex == 0 {
+                guard let currentSection = context.findSection(for: item) else { continue }
+                let baseIdentifier = "\(item.tag.namespace):\(item.tag.title)"
+                if let savedSection = savedSectionForBaseID[baseIdentifier], currentSection != savedSection {
+                    hasMisplacedItems = true
+                    break
+                }
+            }
+        }
 
-        // Only restore if saved items that were hidden/alwaysHidden are now visible,
-        // or if items moved sections incorrectly after app restart.
-        // Skip if no saved items are currently present (app closed).
-        guard !savedTagsInCurrent.isEmpty else {
-            MenuBarItemManager.diagLog.debug("restoreItemsToSavedSections: no saved items currently present, skipping")
+        guard windowIDsChanged || hasMisplacedItems else {
+            MenuBarItemManager.diagLog.debug("restoreItemsToSavedSections: no app restart detected and no misplaced items, skipping")
             return false
         }
 
@@ -4130,9 +4169,7 @@ extension MenuBarItemManager {
         )
 
         // Don't interfere with temporarily shown items.
-        let activelyShownTags = Set(temporarilyShownItemContexts.map {
-            $0.tag.tagIdentifier
-        })
+        let activelyShownTags = Set(temporarilyShownItemContexts.map(\.tag.tagIdentifier))
 
         // Count items per namespace to detect multi-icon apps
         var itemsPerNamespace = [String: Int]()
@@ -4193,21 +4230,20 @@ extension MenuBarItemManager {
             guard currentSection != savedSection else { continue }
 
             // Item is in the wrong section — move it.
-            let destination: MoveDestination
-            switch savedSection {
+            let destination: MoveDestination = switch savedSection {
             case .visible:
-                destination = .rightOfItem(controlItems.hidden)
+                .rightOfItem(controlItems.hidden)
             case .hidden:
                 if let alwaysHidden = controlItems.alwaysHidden {
-                    destination = .rightOfItem(alwaysHidden)
+                    .rightOfItem(alwaysHidden)
                 } else {
-                    destination = .leftOfItem(controlItems.hidden)
+                    .leftOfItem(controlItems.hidden)
                 }
             case .alwaysHidden:
                 if let alwaysHidden = controlItems.alwaysHidden {
-                    destination = .leftOfItem(alwaysHidden)
+                    .leftOfItem(alwaysHidden)
                 } else {
-                    destination = .leftOfItem(controlItems.hidden)
+                    .leftOfItem(controlItems.hidden)
                 }
             }
 
@@ -4301,9 +4337,7 @@ extension MenuBarItemManager {
         guard !previousWindowIDSet.isSubset(of: currentWindowIDSet) else { return false }
 
         // Don't interfere with items that are currently temporarily shown.
-        let activelyShownTags = Set(temporarilyShownItemContexts.map {
-            $0.tag.tagIdentifier
-        })
+        let activelyShownTags = Set(temporarilyShownItemContexts.map(\.tag.tagIdentifier))
 
         // Count items per namespace to detect indexed and multi-icon apps
         var itemsPerNamespace = [String: Int]()
@@ -4319,7 +4353,7 @@ extension MenuBarItemManager {
         // Skip if indexed or multi-icon apps are present. These naturally position
         // themselves, and restoring order causes shuffling.
         let hasMultiIconApps = itemsPerNamespace.values.contains { $0 > 1 }
-        guard !hasIndexedItems && !hasMultiIconApps else {
+        guard !hasIndexedItems, !hasMultiIconApps else {
             MenuBarItemManager.diagLog.debug("restoreSavedItemOrder: skipping due to indexed/multi-icon items present")
             return false
         }
@@ -4550,9 +4584,8 @@ extension MenuBarItemManager {
                 "Menu open check: precise fallback resolving \(unresolvedWindows.count) unresolved window source PIDs"
             )
 
-            let resolvedPIDs: Set<pid_t>
-            if #available(macOS 26.0, *) {
-                resolvedPIDs = await withTaskGroup(of: pid_t?.self, returning: Set<pid_t>.self) { group in
+            let resolvedPIDs: Set<pid_t> = if #available(macOS 26.0, *) {
+                await withTaskGroup(of: pid_t?.self, returning: Set<pid_t>.self) { group in
                     for window in unresolvedWindows {
                         group.addTask {
                             try? await Task<pid_t?, any Error>.withTimeout(.seconds(2)) {
@@ -4570,7 +4603,7 @@ extension MenuBarItemManager {
                     return pids
                 }
             } else {
-                resolvedPIDs = []
+                []
             }
 
             let precisePIDs = fastPathPIDs.union(resolvedPIDs)
@@ -4900,7 +4933,7 @@ extension MenuBarItemManager {
             }
         }
 
-        await cacheActor.clearCachedItemWindowIDs()
+        cacheActor.clearCachedItemWindowIDs()
         itemCache = ItemCache(displayID: nil)
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             self.backgroundCacheContinuation = continuation
@@ -5022,7 +5055,7 @@ extension MenuBarItemManager {
             itemSectionMap: itemSectionMap,
             itemOrder: itemOrder
         )
-        activeProfileItemIdentifiers = Set(itemOrder.values.flatMap { $0 })
+        activeProfileItemIdentifiers = Set(itemOrder.values.flatMap(\.self))
 
         // Prevent the cache cycle from saving intermediate positions.
         isRestoringItemOrder = true
@@ -5150,13 +5183,12 @@ extension MenuBarItemManager {
         }
         if !unmanagedUIDs.isEmpty {
             // Insert screen-right of the Thaw visible control icon.
-            let insertIdx: Int
-            if let visibleIdx = visibleCtrlUID.flatMap({ desiredFiltered.firstIndex(of: $0) }) {
-                insertIdx = visibleIdx + 1
+            let insertIdx: Int = if let visibleIdx = visibleCtrlUID.flatMap({ desiredFiltered.firstIndex(of: $0) }) {
+                visibleIdx + 1
             } else if let hiddenIdx = desiredFiltered.firstIndex(of: hiddenCtrlUID) {
-                insertIdx = hiddenIdx
+                hiddenIdx
             } else {
-                insertIdx = desiredFiltered.count
+                desiredFiltered.count
             }
             desiredFiltered.insert(contentsOf: unmanagedUIDs, at: insertIdx)
             for uid in unmanagedUIDs {
@@ -5175,7 +5207,7 @@ extension MenuBarItemManager {
             let notchGap = MenuBarSection.notchGap
             // Available space: from notch gap to Control Center's left edge.
             let ccItem = items.first(where: { $0.tag == .controlCenter })
-            let rightBoundary = ccItem.map { $0.bounds.minX } ?? screen.frame.maxX
+            let rightBoundary = ccItem.map(\.bounds.minX) ?? screen.frame.maxX
             let availableWidth = rightBoundary - (notch.maxX + notchGap)
 
             // Measure visible item widths from current bounds.
@@ -5393,11 +5425,10 @@ extension MenuBarItemManager {
             // so we can determine current sections from the build order.
             var currentSectionForUID = [String: String]()
             for sectionName in [MenuBarSection.Name.visible, .hidden, .alwaysHidden] {
-                let key: String
-                switch sectionName {
-                case .visible: key = "visible"
-                case .hidden: key = "hidden"
-                case .alwaysHidden: key = "alwaysHidden"
+                let key = switch sectionName {
+                case .visible: "visible"
+                case .hidden: "hidden"
+                case .alwaysHidden: "alwaysHidden"
                 }
                 let sectionItems = items.filter { item in
                     guard isProfileItem(item) else { return false }
@@ -5440,19 +5471,18 @@ extension MenuBarItemManager {
                 // boundary needed).
                 let desiredHiddenUIDs = itemOrder["hidden"] ?? []
                 if let ahItem = allFreshItems.first(where: { $0.uniqueIdentifier == ahCtrlUID }) {
-                    let dest: MoveDestination?
-                    if let firstHiddenUID = desiredHiddenUIDs.first,
-                       let firstHidden = allFreshItems.first(where: { $0.uniqueIdentifier == firstHiddenUID && $0.isMovable })
+                    let dest: MoveDestination? = if let firstHiddenUID = desiredHiddenUIDs.first,
+                                                    let firstHidden = allFreshItems.first(where: { $0.uniqueIdentifier == firstHiddenUID && $0.isMovable })
                     {
                         // Place AH_ctrl to the LEFT of the rightmost hidden
                         // item. This puts AH_ctrl between AH items and
                         // hidden items.
-                        dest = .leftOfItem(firstHidden)
+                        .leftOfItem(firstHidden)
                     } else if let hItem = allFreshItems.first(where: { $0.uniqueIdentifier == hiddenCtrlUID }) {
                         // Hidden is empty — AH_ctrl goes next to H_ctrl.
-                        dest = .leftOfItem(hItem)
+                        .leftOfItem(hItem)
                     } else {
-                        dest = nil
+                        nil
                     }
 
                     if let dest {
@@ -5560,11 +5590,10 @@ extension MenuBarItemManager {
                 }
 
                 let targetKey = sectionMap[uid] ?? "visible"
-                let targetSection: MenuBarSection.Name
-                switch targetKey {
-                case "hidden": targetSection = .hidden
-                case "alwaysHidden": targetSection = .alwaysHidden
-                default: targetSection = .visible
+                let targetSection: MenuBarSection.Name = switch targetKey {
+                case "hidden": .hidden
+                case "alwaysHidden": .alwaysHidden
+                default: .visible
                 }
 
                 var dest: MoveDestination?
@@ -5666,7 +5695,7 @@ extension MenuBarItemManager {
         var result = Set<String>()
         var i = m
         var j = n
-        while i > 0 && j > 0 {
+        while i > 0, j > 0 {
             if a[i - 1] == b[j - 1] {
                 result.insert(a[i - 1])
                 i -= 1; j -= 1
